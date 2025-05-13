@@ -1,0 +1,162 @@
+# Overrides for the chart name and its computed full name.
+#
+# In most cases these can be left as null, but if you want your resources to be prefixed
+# with a different name than the release name, you can specify fullnameOverride to the
+# desired prefix.
+nameOverride: ""
+fullnameOverride: ""
+
+# The number of replicas in the StatefulSet
+replicaCount: 1
+
+# These are the usual things for pods
+affinity: {}
+nodeName: null
+nodeSelector: {}
+podAnnotations: {}
+podLabels: {}
+tolerations: []
+topologySpreadConstraints: []
+
+# Sets the runtime class for the pod. The runtime class must already be properly
+# configured on Kubernetes nodes and a RuntimeClass resource must exist with the given
+# name.
+#
+# The main use case for this is to run the runner in a Kata container, which provides
+# better security because DinD requires privileged containers and so, without the
+# additional virtualization offered by Kata, could be used to compromise the node.
+#
+# When kata is used, in order for things to work properly, you will need to set
+# docker.loopMountedDisk.enabled to true, and docker.rootless to false.
+#
+# This basically works but it's got some rough edges so it's considered EXPERIMENTAL.
+# With kata, the rough edges include:
+#   1. Janky workaround needed for docker persistence (see docker.loopMountedDisk below)
+#   2. Inability to exec into docker container
+#      https://github.com/kata-containers/kata-containers/issues/9701
+#   3. Broken on arm64 when defining any cpu limits
+#      https://github.com/kata-containers/kata-containers/issues/2291
+runtimeClassName: null
+
+
+# Disabling persistence will store data on an emptyDir, so will be lost when the pod is
+# cycled. In this case, whenever act_runner starts, it will register a new runner with
+# Gitea, leaving the previous runner(s) lying around defunct in Gitea's runner list.
+#
+# If persistence is enabled (default), in addition to ensuring the runner's identity is
+# stable between pod restarts, it also improves performance by maintaining a cache (both
+# downloaded actions and Docker images).
+persistence:
+  enabled: true
+  # Labels for the persistent volume claim
+  labels: {}
+  # If null, the default storage class will be used
+  storageClassName: null
+  size: 10Gi
+  accessModes:
+    - ReadWriteOnce
+
+#
+# Configuration for the docker container in the pod
+#
+docker:
+  image:
+    repository: docker.io/docker
+    # If null, then either "dind" or "dind-rootless" will be used depending on the value
+    # of docker.rootless below. If docker.image.tag is specified, then this image will
+    # always be used regardless of docker.rootless.
+    tag: null
+    pullPolicy: null
+
+  resources:
+    requests:
+      memory: 250Mi
+      cpu: 50m
+
+  # If true, the docker container will use rootless docker-in-docker.
+  #
+  # It is not supported to change this value after a volume has already been created.  You
+  # will need to delete the PVC first.
+  rootless: false
+
+  # This custom configuration is added to /etc/docker/daemon.json in the Docker container.
+  # Expressed here as standard YAML and it's JSONified during render.
+  daemonConfig: {}
+    # "registry-mirrors":  ["https://my-dockerio-mirror.example.com"]
+
+  # If true, the docker data directory is mounted as a loop device with a file backed on
+  # the PV, rather than the PV directly. This is necessary when using kata as a runtime
+  # class, and implements the workaround documented at
+  # https://github.com/kata-containers/kata-containers/blob/main/docs/how-to/how-to-run-docker-with-kata.md
+  loopMountedDisk:
+    # If using runtimeClass=kata, this must be enabled.
+    enabled: false
+    # Computes the size of the docker disk image as a percentage of storage.size. This
+    # is ignored of docker.loopMountedDisk.size is defined.
+    sizePercentage: 0.8
+    # The absolute size of the docker disk image
+    size: null
+
+#
+# Configuration for the runner container in the pod
+#
+runner:
+  image:
+    repository: docker.io/gitea/act_runner
+    # Pin to nightly v0.2.11+19-g5302c25. act_runner is a bit of a moving target, so set
+    # this to "nightly" at your own risk.
+    tag: nightly@sha256:6ee65fb44d94adb889f558033a03427eaf4d3628ac881be42aab4e53ff968ac7
+    # If you do use "nightly" above you probably want to set this to Always.
+    pullPolicy: null
+
+  resources:
+    requests:
+      memory: 100Mi
+      cpu: 15m
+
+  # Base URL of the Gitea instance
+  gitea_url: https://gitea.example.com/
+
+  # Registration token value.
+  #
+  # See https://docs.gitea.com/usage/actions/act-runner#obtain-a-registration-token
+  #
+  # Either this or tokenSecretName is required or the chart won't install. If this
+  # is specified, it will take precedence over tokenSecretName.
+  token: ""
+  # As an alternative to specifying the token value, you can pass the token in a
+  # pre-existing Kubernetes secret.  The secret must have a key "token" with the
+  # appropriate registration token value.
+  #
+  # Either this or token (above) is required or the chart won't install.
+  tokenSecretName: null
+
+  # (Currently just amd64 or arm64 are supported.) With this enabled, jobs can include
+  # either "amd64" or "arm64" in their runs-on list to target the runner by architecture.
+  includeArchLabel: true
+
+  # Content of the act_runner config file
+  #
+  # See https://docs.gitea.com/usage/actions/act-runner#configuration
+  config:
+    log:
+      level: debug
+    runner:
+      labels:
+        - "ubuntu-latest:docker://catthehacker/ubuntu:runner-24.04"
+        - "ubuntu-24.04:docker://catthehacker/ubuntu:runner-24.04"
+        - "ubuntu-22.04:docker://catthehacker/ubuntu:runner-22.04"
+        - "alpine-latest:docker://alpine:latest"
+        - "kubernetes:host"
+
+    # This configuration permits jobs to access the pod's Docker daemon.
+    # To disable this, set runner.config.container=null in your values file.
+    container:
+      valid_volumes:
+        - /certs/client
+      options: |
+        --add-host=docker:host-gateway
+        -v /certs/client:/certs/client
+        -e "DOCKER_HOST=tcp://docker:2376/"
+        -e "DOCKER_TLS_VERIFY=1"
+        -e "DOCKER_CERT_PATH=/certs/client"

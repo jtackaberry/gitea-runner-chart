@@ -1,0 +1,240 @@
+{{- $name := include "gitea-runner.name" . -}}
+{{- if and .Values.docker.loopMountedDisk.enabled .Values.docker.rootless }}
+  {{- fail (printf "Error: loopMountedDisk.enabled is not supported with rootless docker") }}
+{{- end }}
+{{- if and (not .Values.docker.loopMountedDisk.enabled) (eq .Values.runtimeClassName "kata") }}
+  {{- fail (printf "Error: when runtimeClassName is 'kata' docker.loopMountedDisk.enabled must be true or else dockerd will fail to start") }}
+{{- end }}
+{{- $loopDiskSize := trimSuffix "i" (
+    .Values.docker.loopMountedDisk.size | default (
+        printf "%.0f%s"
+        (regexReplaceAll "\\D*" .Values.persistence.size "" |
+         mulf .Values.docker.loopMountedDisk.sizePercentage)
+        (regexReplaceAll "\\d*" .Values.persistence.size "")
+    )
+)}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "gitea-runner.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "gitea-runner.selectorLabels" . | nindent 6 }}
+  serviceName: {{ $name }}-headless
+  template:
+    metadata:
+      labels:
+        {{- include "gitea-runner.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+          {{ toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ toYaml (list .Values.runner.config .Values.docker.daemonConfig .Values.runner.token) | sha256sum }}
+        {{- with .Values.podAnnotations }}
+            {{ toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.runtimeClassName }}
+      runtimeClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.nodeName }}
+      nodeName: {{ . }}
+      {{- end }}
+      restartPolicy: Always
+      securityContext:
+        # Runner container image makes these assumptions
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        # Prevent setgid bit from propagating into docker overlay paths which mangles
+        # permissions inside mounted containers
+        fsGroupChangePolicy: "OnRootMismatch"
+      nodeSelector:
+        {{- with .Values.nodeSelector }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+      tolerations:
+        {{- with .Values.tolerations }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+      affinity:
+        {{- with .Values.affinity }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+      topologySpreadConstraints:
+        {{- with .Values.topologySpreadConstraints }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+      {{- if not .Values.persistence.enabled }}
+        - name: storage
+          emptyDir: {}
+      {{- end }}
+        - name: secrets
+          secret:
+            {{- if .Values.runner.token }}
+            secretName: {{ $name }}
+            {{- else }}
+            secretName: {{ .Values.runner.tokenSecretName }}
+            {{- end }}
+        - name: config-runner
+          configMap:
+            name: {{ $name }}-runner
+        - name: config-docker
+          configMap:
+            name: {{ $name }}-docker
+        - name: certs
+          emptyDir:
+            medium: Memory
+        - name: test
+          emptyDir:
+            medium: Memory
+
+      containers:
+        - name: runner
+          {{- with .Values.runner.image }}
+          image: {{ .repository }}:{{ .tag }}
+          {{- end }}
+          {{- with .Values.runner.image.pullPolicy }}
+          imagePullPolicy: {{ . }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.runner.resources | nindent 12 }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |-
+              set -e
+              cp /config/config.yaml /tmp/config.yaml
+              {{- if .Values.runner.includeArchLabel }}
+              # Include architecture as custom label
+              arch="$(uname -m)"
+              if [ "$arch" = "x86_64" ]; then
+                arch=amd64
+              elif [ "$arch" = "aarch64" ]; then
+                arch=arm64
+              fi
+              # This only works because we know how config.yaml is indented
+              sed -i "/^ *labels:/a\  - $arch:host" /tmp/config.yaml
+              {{- end }}
+
+              echo Waiting for docker daemon ...
+              while [ ! -r $DOCKER_CERT_PATH/key.pem ] || ! nc -z localhost 2376; do
+                sleep 0.5
+              done
+              echo "Docker daemon is ready"
+              exec /sbin/tini -- /usr/local/bin/run.sh
+          env:
+          - name: DOCKER_HOST
+            value: tcp://localhost:2376
+          - name: DOCKER_CERT_PATH
+            value: /certs/client
+          - name: DOCKER_TLS_VERIFY
+            value: "1"
+          - name: CONFIG_FILE
+            value: /tmp/config.yaml
+          - name: GITEA_INSTANCE_URL
+            value: {{ .Values.runner.gitea_url }}
+          - name: GITEA_RUNNER_REGISTRATION_TOKEN_FILE
+            value: /secrets/token
+          # We're using a non-root user that isn't in /etc/passwd so we need to set HOME.
+          # This Ensures cache goes to /data/.cache rather than /.cache
+          - name: HOME
+            value: /data
+          volumeMounts:
+            - name: storage
+              subPath: runner
+              mountPath: /data
+            - name: config-runner
+              mountPath: /config
+            - name: secrets
+              mountPath: /secrets
+            - name: certs
+              mountPath: /certs
+
+        - name: docker
+          {{- with .Values.docker.image }}
+          image: {{ .repository }}:{{ .tag | default (ternary "dind-rootless" "dind" $.Values.docker.rootless) }}
+          {{- end }}
+          {{- with .Values.docker.image.pullPolicy }}
+          imagePullPolicy: {{ . }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.docker.resources | nindent 12 }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |-
+              set -e
+              {{- if .Values.docker.loopMountedDisk.enabled }}
+              if [ ! -f /data/docker.img ]; then
+                echo "Creating disk image for docker storage"
+                apk add e2fsprogs
+                truncate -s {{ $loopDiskSize }} /data/docker.img
+                mkfs.ext4 /data/docker.img
+              else
+                echo "Preserving existing disk image for docker storage"
+              fi
+              mkdir -p /data/docker
+              mount /data/docker.img /data/docker
+              {{- end }}
+
+              # Using /etc/docker/daemon.json isn't the default with rootless, so force
+              # it (which is innocuous for the dind variant).
+              exec /usr/local/bin/dockerd-entrypoint.sh --config-file /etc/docker/daemon.json
+          env:
+          - name: DOCKER_HOST
+            value: tcp://localhost:2376
+          - name: DOCKER_TLS_CERTDIR
+            value: /certs
+          - name: DOCKER_TLS_VERIFY
+            value: "1"
+          # Use the client certs when running docker commands execed into the container
+          - name: DOCKER_CERT_PATH
+            value: /certs/client
+          - name: HOME
+            value: /data/docker
+          securityContext:
+            # Privileged is always needed, even for rootless dind :(
+            privileged: true
+            {{- if not .Values.docker.rootless }}
+            runAsUser: 0
+            runAsGroup: 0
+            appArmorProfile:
+              type: Unconfined
+            seccompProfile:
+              type: Unconfined
+            {{- else }}
+            runAsNonRoot: true
+            {{- end }}
+          volumeMounts:
+            - name: certs
+              mountPath: /certs
+            - name: config-docker
+              mountPath: /etc/docker
+            - name: storage
+              mountPath: /data
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - kind: PersistentVolumeClaim
+      apiVersion: v1
+      metadata:
+        name: storage
+        {{- with .Values.persistence.labels }}
+        labels:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        {{- with .Values.persistence.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        {{- with .Values.persistence.accessModes }}
+        accessModes:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | default "10Gi" }}
+  {{- end }}

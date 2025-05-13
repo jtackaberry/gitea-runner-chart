@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "runner": {
+      "type": "object",
+      "anyOf": [
+        {
+          "properties": {
+            "token": {
+              "type": "string",
+              "pattern": "^.+$"
+            }
+          }
+        },
+        {
+          "properties": {
+            "tokenSecretName": {
+              "type": "string",
+              "pattern": "^.+$"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "gitea_url": {
+          "allOf": [
+            {
+              "type": "string",
+              "pattern": "^https?://.*$"
+            },
+            {
+              "type": "string",
+              "not": {
+                "pattern": "gitea.example.com"
+              }
+            }
+          ]
+        }
+      },
+      "required": ["gitea_url"]
+    }
+  },
+  "required": ["runner"]
+}

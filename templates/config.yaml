@@ -1,0 +1,21 @@
+{{- $name := include "gitea-runner.name" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-runner
+  labels:
+    {{- include "gitea-runner.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{ toYaml .Values.runner.config | nindent 4 }}
+---
+{{- $_ := set .Values.docker.daemonConfig "data-root" "/data/docker" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-docker
+  labels:
+    {{- include "gitea-runner.labels" . | nindent 4 }}
+data:
+  daemon.json: |
+    {{- mustToPrettyJson .Values.docker.daemonConfig | nindent 4 }}
